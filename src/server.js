@@ -9,9 +9,24 @@ const app = express();
 const port = Number(process.env.PORT || 3000);
 app.use(
   cors({
-    origin: process.env.CORS_ORIGIN
-      ? process.env.CORS_ORIGIN.split(",").map((v) => v.trim())
-      : true,
+    origin: (origin, callback) => {
+      const allowedOrigins = ["https://agendamento-frontend-react.vercel.app"];
+
+      // Permite ferramentas como Postman e chamadas sem Origin
+      if (!origin) {
+        return callback(null, true);
+      }
+
+      if (allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+
+      console.log("CORS bloqueado:", origin);
+
+      return callback(new Error("Origem não permitida pelo CORS."));
+    },
+    methods: ["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
   }),
 );
 app.use(express.json());
