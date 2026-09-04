@@ -10,7 +10,10 @@ const port = Number(process.env.PORT || 3000);
 app.use(
   cors({
     origin: (origin, callback) => {
-      const allowedOrigins = ["https://agendamento-frontend-react.vercel.app"];
+      const allowedOrigins = [
+        "https://agendamento-frontend-react.vercel.app",
+        "http://localhost:5173",
+      ];
 
       // Permite ferramentas como Postman e chamadas sem Origin
       if (!origin) {
@@ -140,6 +143,7 @@ app.post("/api/auth/login", async (req, res) => {
 
 app.get("/api/clients/search", auth, async (req, res) => {
   try {
+    const userId = Number(req.user.sub);
     const name = normalizeName(req.query.name);
     if (name.length < 3)
       return res
@@ -148,6 +152,7 @@ app.get("/api/clients/search", auth, async (req, res) => {
     const { data, error } = await supabase
       .from("clients")
       .select("id,name,address,massage_count,created_at")
+      .eq("user_id", userId)
       .ilike("name", `%${name}%`)
       .order("name")
       .limit(20);
@@ -161,6 +166,7 @@ app.get("/api/clients/search", auth, async (req, res) => {
 
 app.post("/api/clients", auth, async (req, res) => {
   try {
+    const userId = Number(req.user.sub);
     const name = normalizeName(req.body.name),
       address = req.body.address ? String(req.body.address).trim() : null,
       massage_count = Math.max(0, Number(req.body.massage_count || 0));
@@ -169,6 +175,7 @@ app.post("/api/clients", auth, async (req, res) => {
     const { data: existing, error: ee } = await supabase
       .from("clients")
       .select("id,name,address,massage_count,created_at")
+      .eq("user_id", userId)
       .ilike("name", name)
       .limit(1)
       .maybeSingle();
@@ -177,7 +184,7 @@ app.post("/api/clients", auth, async (req, res) => {
       return res.json({ client: clientResponse(existing), existing: true });
     const { data, error } = await supabase
       .from("clients")
-      .insert({ name, address, massage_count })
+      .insert({ user_id: userId, name, address, massage_count })
       .select("id,name,address,massage_count,created_at")
       .single();
     if (error) throw error;
@@ -190,9 +197,11 @@ app.post("/api/clients", auth, async (req, res) => {
 
 app.get("/api/appointments", auth, async (req, res) => {
   try {
+    const userId = Number(req.user.sub);
     let q = supabase
       .from("appointments")
       .select(appointmentSelect)
+      .eq("user_id", userId)
       .order("appointment_date")
       .order("start_time")
       .order("id");
@@ -224,6 +233,7 @@ app.post("/api/appointments", auth, async (req, res) => {
       end_time = null,
       notes = null,
     } = req.body;
+    const userId = Number(req.user.sub);
 
     const clientId = Number(client_id);
     const count = Number(massage_count);
@@ -354,6 +364,7 @@ app.post("/api/appointments", auth, async (req, res) => {
     const { data, error } = await supabase
       .from("appointments")
       .insert({
+        user_id: userId,
         client_id: clientId,
         is_package,
         massage_count: count,
@@ -408,32 +419,100 @@ app.patch("/api/appointments/:id/status", auth, async (req, res) => {
 app.patch("/api/appointments/:id/payment", auth, async (req, res) => {
   try {
     const id = Number(req.params.id);
-    if (typeof req.body.paid !== "boolean")
-      return res.status(400).json({ error: "paid deve ser boolean." });
+    const userId = Number(req.user.sub);
+
+    if (!Number.isInteger(id) || id <= 0) {
+      return res.status(400).json({
+        error: "ID do agendamento inválido.",
+      });
+    }
+
+    if (typeof req.body.paid !== "boolean") {
+      return res.status(400).json({
+        error: "paid deve ser boolean.",
+      });
+    }
+
+    const paid = req.body.paid;
+    const paidAt = paid ? new Date().toISOString() : null;
+
+    // 1. Busca o agendamento que está sendo alterado
+    const { data: appointment, error: appointmentError } = await supabase
+      .from("appointments")
+      .select("id, client_id, is_package")
+      .eq("id", id)
+      .eq("user_id", userId)
+      .maybeSingle();
+
+    if (appointmentError) throw appointmentError;
+
+    if (!appointment) {
+      return res.status(404).json({
+        error: "Agendamento não encontrado.",
+      });
+    }
+
+    // 2. Se for pacote, pega o client_id e paga
+    // todos os agendamentos de pacote desse cliente
+    if (appointment.is_package === true) {
+      console.log('appointment.is_package', appointment.is_package)
+      const { error } = await supabase
+        .from("appointments")
+        .update({
+          paid,
+          paid_at: paidAt,
+        })
+        .eq("client_id", appointment.client_id)
+        .eq("is_package", true);
+
+      if (error) throw error;
+    } else {
+      // 3. Agendamento normal:
+      // altera somente o próprio agendamento
+      const { error } = await supabase
+        .from("appointments")
+        .update({
+          paid,
+          paid_at: paidAt,
+        })
+        .eq("id", id)
+        .eq("user_id", userId);
+
+      if (error) throw error;
+    }
+
+    // 4. Busca novamente o agendamento para retornar atualizado
     const { data, error } = await supabase
       .from("appointments")
-      .update({
-        paid: req.body.paid,
-        paid_at: req.body.paid ? new Date().toISOString() : null,
-      })
-      .eq("id", id)
       .select(appointmentSelect)
+      .eq("id", id)
+      .eq("user_id", userId)
       .maybeSingle();
+
     if (error) throw error;
-    if (!data)
-      return res.status(404).json({ error: "Agendamento não encontrado." });
+
+    if (!data) {
+      return res.status(404).json({
+        error: "Agendamento não encontrado.",
+      });
+    }
+
     res.json(appointmentResponse(data));
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: "Erro ao alterar pagamento." });
+    res.status(500).json({
+      error: "Erro ao alterar pagamento.",
+    });
   }
 });
 
 app.get("/api/payments/pending", auth, async (_req, res) => {
   try {
+    const userId = Number(req.user.sub);
     const { data, error } = await supabase
       .from("appointments")
       .select(appointmentSelect)
+      .eq('user_id', userId)
       .eq("paid", false)
       .neq("status", "cancelado")
       .order("appointment_date")
@@ -456,6 +535,8 @@ app.get("/api/payments/pending", auth, async (_req, res) => {
 
 app.get("/api/payments/summary", auth, async (req, res) => {
   try {
+        const userId = Number(req.user.sub);
+
     const month = String(req.query.month || "");
     if (!/^\d{4}-\d{2}$/.test(month))
       return res
@@ -468,6 +549,7 @@ app.get("/api/payments/summary", auth, async (req, res) => {
     const { data, error } = await supabase
       .from("appointments")
       .select("value_cents,paid")
+      .eq('user_id', userId)
       .gte("appointment_date", `${month}-01`)
       .lt("appointment_date", next)
       .neq("status", "cancelado");

@@ -31,6 +31,18 @@ create table if not exists public.appointments (
   created_at timestamptz not null default now()
 );
 
+ALTER TABLE public.clients
+ADD COLUMN user_id bigint REFERENCES public.users(id) ON DELETE CASCADE;
+
+ALTER TABLE public.appointments
+ADD COLUMN user_id bigint REFERENCES public.users(id) ON DELETE CASCADE;
+
+CREATE INDEX IF NOT EXISTS idx_clients_user_id
+ON public.clients(user_id);
+
+CREATE INDEX IF NOT EXISTS idx_appointments_user_id
+ON public.appointments(user_id);
+
 create index if not exists idx_clients_name_lower on public.clients (lower(name));
 create index if not exists idx_appointments_date_time on public.appointments (appointment_date,start_time);
 create index if not exists idx_appointments_client on public.appointments (client_id);
