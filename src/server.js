@@ -282,6 +282,7 @@ app.post("/api/appointments", auth, async (req, res) => {
     const { data: conflict, error: xe } = await supabase
       .from("appointments")
       .select("id")
+      .eq("user_id", userId)
       .eq("appointment_date", appointment_date)
       .eq("start_time", start_time)
       .neq("status", "cancelado")
@@ -455,7 +456,7 @@ app.patch("/api/appointments/:id/payment", auth, async (req, res) => {
     // 2. Se for pacote, pega o client_id e paga
     // todos os agendamentos de pacote desse cliente
     if (appointment.is_package === true) {
-      console.log('appointment.is_package', appointment.is_package)
+      console.log("appointment.is_package", appointment.is_package);
       const { error } = await supabase
         .from("appointments")
         .update({
@@ -512,7 +513,7 @@ app.get("/api/payments/pending", auth, async (_req, res) => {
     const { data, error } = await supabase
       .from("appointments")
       .select(appointmentSelect)
-      .eq('user_id', userId)
+      .eq("user_id", userId)
       .eq("paid", false)
       .neq("status", "cancelado")
       .order("appointment_date")
@@ -535,7 +536,7 @@ app.get("/api/payments/pending", auth, async (_req, res) => {
 
 app.get("/api/payments/summary", auth, async (req, res) => {
   try {
-        const userId = Number(req.user.sub);
+    const userId = Number(req.user.sub);
 
     const month = String(req.query.month || "");
     if (!/^\d{4}-\d{2}$/.test(month))
@@ -549,7 +550,7 @@ app.get("/api/payments/summary", auth, async (req, res) => {
     const { data, error } = await supabase
       .from("appointments")
       .select("value_cents,paid")
-      .eq('user_id', userId)
+      .eq("user_id", userId)
       .gte("appointment_date", `${month}-01`)
       .lt("appointment_date", next)
       .neq("status", "cancelado");
