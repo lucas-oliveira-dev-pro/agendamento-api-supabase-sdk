@@ -233,53 +233,82 @@ app.post("/api/appointments", auth, async (req, res) => {
       end_time = null,
       notes = null,
     } = req.body;
+
     const userId = Number(req.user.sub);
 
     const clientId = Number(client_id);
     const count = Number(massage_count);
     const cents = Number(value_cents);
 
-    if (!Number.isInteger(clientId) || clientId <= 0)
+    // ============================================================
+    // VALIDAÇÕES
+    // ============================================================
+
+    if (!Number.isInteger(clientId) || clientId <= 0) {
       return res.status(400).json({
         error: "client_id inválido.",
       });
+    }
 
-    if (typeof is_package !== "boolean")
+    if (typeof is_package !== "boolean") {
       return res.status(400).json({
         error: "is_package deve ser boolean.",
       });
+    }
 
-    if (!Number.isInteger(count) || count < 1)
+    if (!Number.isInteger(count) || count < 1) {
       return res.status(400).json({
         error: "massage_count deve ser inteiro >= 1.",
       });
+    }
 
-    if (!Number.isInteger(cents) || cents < 0)
+    if (!Number.isInteger(cents) || cents < 0) {
       return res.status(400).json({
         error: "value_cents inválido.",
       });
+    }
 
-    if (!address || !appointment_date || !start_time)
+    if (!address || !String(address).trim()) {
       return res.status(400).json({
-        error: "address, appointment_date e start_time são obrigatórios.",
+        error: "address é obrigatório.",
       });
+    }
 
-    // Busca o cliente
-    const { data: client, error: ce } = await supabase
+    if (!appointment_date || !start_time) {
+      return res.status(400).json({
+        error: "appointment_date e start_time são obrigatórios.",
+      });
+    }
+
+    // ============================================================
+    // BUSCA O CLIENTE
+    // ============================================================
+
+    const { data: client, error: clientError } = await supabase
       .from("clients")
       .select("id,name,massage_count")
       .eq("id", clientId)
       .maybeSingle();
 
-    if (ce) throw ce;
+    if (clientError) {
+      throw clientError;
+    }
 
-    if (!client)
+    if (!client) {
       return res.status(404).json({
         error: "Cliente não encontrado.",
       });
+    }
 
-    // Verifica conflito de horário
-    const { data: conflict, error: xe } = await supabase
+    // Guarda o saldo original para possível rollback
+    const originalClientMassageCount =
+      Number(client.massage_count) || 0;
+
+    // ============================================================
+    // VERIFICA CONFLITO DE HORÁRIO
+    // ============================================================
+
+    const { data: conflict, error: conflictError } = await supabase
       .from("appointments")
       .select("id")
       .eq("user_id", userId)
@@ -288,80 +317,195 @@ app.post("/api/appointments", auth, async (req, res) => {
       .neq("status", "cancelado")
       .limit(1);
 
-    if (xe) throw xe;
+    if (conflictError) {
+      throw conflictError;
+    }
 
-    if (conflict?.length)
+    if (conflict?.length) {
       return res.status(409).json({
         error: "Já existe um agendamento nesse dia e horário.",
       });
+    }
 
-    /*
-     * ============================================================
-     * ADICIONA AS MASSAGENS AO CLIENTE
-     * ============================================================
-     *
-     * Só adiciona quando o NOVO agendamento é um pacote.
-     *
-     * Exemplo:
-     *
-     * Cliente:
-     * massage_count = 2
-     *
-     * Novo pacote:
-     * massage_count = 4
-     *
-     * Resultado:
-     * massage_count = 6
-     */
-    if (is_package) {
-      const currentMassageCount = Number(client.massage_count) || 0;
-      const newMassageCount = currentMassageCount + count;
+    // ============================================================
+    // VARIÁVEIS DE CONTROLE
+    // ============================================================
+
+    let newAppointmentPaid = false;
+
+    let packageAppointment = null;
+    let originalPackageMassageCount = null;
+
+    let clientMassageCountWasUpdated = false;
+
+    // ============================================================
+    // REGRA 1
+    // PACOTE COM MAIS DE 1 MASSAGEM
+    // ============================================================
+    //
+    // Exemplo:
+    //
+    // Cliente:
+    // massage_count = 2
+    //
+    // Novo pacote:
+    // massage_count = 4
+    //
+    // Resultado:
+    // Cliente:
+    // massage_count = 6
+    //
+    // ============================================================
+
+    if (is_package && count > 1) {
+      const newClientMassageCount =
+        originalClientMassageCount + (count - 1);
 
       const { error: updateClientError } = await supabase
         .from("clients")
         .update({
-          massage_count: newMassageCount,
+          massage_count: newClientMassageCount,
         })
         .eq("id", clientId);
 
-      if (updateClientError) throw updateClientError;
+      if (updateClientError) {
+        throw updateClientError;
+      }
+
+      clientMassageCountWasUpdated = true;
     }
-    /*
-     * ============================================================
-     * ABATER UMA MASSAGEM DO CLIENTE
-     * ============================================================
-     *
-     * Só abate quando o NOVO agendamento é um pacote.
-     *
-     * Exemplo:
-     *
-     * Cliente:
-     * massage_count = 4
-     *
-     * Novo agendamento:
-     * is_package = true
-     *
-     * Resultado:
-     * massage_count = 3
-     */
-    if (is_package && Number(client.massage_count) > 1) {
-      const newMassageCount = Number(client.massage_count) - 1;
+
+    // ============================================================
+    // REGRA 2
+    // PACOTE COM EXATAMENTE 1 MASSAGEM
+    // ============================================================
+    //
+    // Nesse caso estamos consumindo uma massagem disponível.
+    //
+    // 1. Verifica saldo do cliente.
+    // 2. Procura o primeiro pacote com massage_count > 1.
+    // 3. Abate 1 do pacote.
+    // 4. Abate 1 do cliente.
+    // 5. Se o pacote estiver pago, o novo agendamento será pago.
+    //
+    // ============================================================
+
+    if (is_package && count === 1) {
+      // ----------------------------------------------------------
+      // VERIFICA SALDO DO CLIENTE
+      // ----------------------------------------------------------
+
+      if (originalClientMassageCount <= 0) {
+        return res.status(400).json({
+          error: "Cliente não possui massagens disponíveis.",
+        });
+      }
+
+      // ----------------------------------------------------------
+      // PROCURA O PRIMEIRO PACOTE DISPONÍVEL
+      // ----------------------------------------------------------
+
+      const {
+        data: availablePackage,
+        error: packageError,
+      } = await supabase
+        .from("appointments")
+        .select(
+          "id,massage_count,paid,appointment_date,start_time"
+        )
+        .eq("user_id", userId)
+        .eq("client_id", clientId)
+        .eq("is_package", true)
+        .gt("massage_count", 1)
+        .neq("status", "cancelado")
+        .order("appointment_date", { ascending: true })
+        .order("start_time", { ascending: true })
+        .order("id", { ascending: true })
+        .limit(1)
+        .maybeSingle();
+
+      if (packageError) {
+        throw packageError;
+      }
+
+      // ----------------------------------------------------------
+      // NÃO ENCONTROU PACOTE
+      // ----------------------------------------------------------
+
+      if (!availablePackage) {
+        return res.status(400).json({
+          error:
+            "Não foi encontrado um pacote com massagens disponíveis para este cliente.",
+        });
+      }
+
+      packageAppointment = availablePackage;
+
+      originalPackageMassageCount =
+        Number(packageAppointment.massage_count) || 0;
+
+      // ----------------------------------------------------------
+      // DEFINE O PAGAMENTO DO NOVO AGENDAMENTO
+      // ----------------------------------------------------------
+
+      if (packageAppointment.paid === true) {
+        newAppointmentPaid = true;
+      }
+
+      // ----------------------------------------------------------
+      // ABATE 1 DO PACOTE
+      // ----------------------------------------------------------
+
+      const newPackageMassageCount =
+        originalPackageMassageCount - 1;
+
+      const { error: updatePackageError } = await supabase
+        .from("appointments")
+        .update({
+          massage_count: newPackageMassageCount,
+        })
+        .eq("id", packageAppointment.id);
+
+      if (updatePackageError) {
+        throw updatePackageError;
+      }
+
+      // ----------------------------------------------------------
+      // ABATE 1 DO SALDO DO CLIENTE
+      // ----------------------------------------------------------
+
+      const newClientMassageCount =
+        originalClientMassageCount - 1;
 
       const { error: updateClientError } = await supabase
         .from("clients")
         .update({
-          massage_count: newMassageCount,
+          massage_count: newClientMassageCount,
         })
         .eq("id", clientId);
 
-      if (updateClientError) throw updateClientError;
+      if (updateClientError) {
+        // --------------------------------------------------------
+        // ROLLBACK DO PACOTE
+        // --------------------------------------------------------
+
+        await supabase
+          .from("appointments")
+          .update({
+            massage_count: originalPackageMassageCount,
+          })
+          .eq("id", packageAppointment.id);
+
+        throw updateClientError;
+      }
+
+      clientMassageCountWasUpdated = true;
     }
 
-    /*
-     * ============================================================
-     * CRIA O NOVO AGENDAMENTO
-     * ============================================================
-     */
+    // ============================================================
+    // CRIA O NOVO AGENDAMENTO
+    // ============================================================
+
     const { data, error } = await supabase
       .from("appointments")
       .insert({
@@ -375,19 +519,76 @@ app.post("/api/appointments", auth, async (req, res) => {
         start_time,
         end_time,
         status: "agendado",
-        paid: false,
+        paid: newAppointmentPaid,
         notes,
       })
       .select(appointmentSelect)
       .single();
 
-    if (error) throw error;
+    // ============================================================
+    // ERRO AO CRIAR AGENDAMENTO
+    // ============================================================
 
-    res.status(201).json(appointmentResponse(data));
+    if (error) {
+      console.error(
+        "Erro ao criar agendamento. Iniciando rollback:",
+        error
+      );
+
+      // ----------------------------------------------------------
+      // ROLLBACK DO PACOTE UTILIZADO
+      // ----------------------------------------------------------
+
+      if (packageAppointment) {
+        const { error: rollbackPackageError } = await supabase
+          .from("appointments")
+          .update({
+            massage_count: originalPackageMassageCount,
+          })
+          .eq("id", packageAppointment.id);
+
+        if (rollbackPackageError) {
+          console.error(
+            "Erro ao fazer rollback do pacote:",
+            rollbackPackageError
+          );
+        }
+      }
+
+      // ----------------------------------------------------------
+      // ROLLBACK DO SALDO DO CLIENTE
+      // ----------------------------------------------------------
+
+      if (clientMassageCountWasUpdated) {
+        const { error: rollbackClientError } = await supabase
+          .from("clients")
+          .update({
+            massage_count: originalClientMassageCount,
+          })
+          .eq("id", clientId);
+
+        if (rollbackClientError) {
+          console.error(
+            "Erro ao fazer rollback do cliente:",
+            rollbackClientError
+          );
+        }
+      }
+
+      throw error;
+    }
+
+    // ============================================================
+    // SUCESSO
+    // ============================================================
+
+    return res.status(201).json(
+      appointmentResponse(data)
+    );
   } catch (e) {
-    console.error(e);
+    console.error("Erro ao criar agendamento:", e);
 
-    res.status(500).json({
+    return res.status(500).json({
       error: "Erro ao criar agendamento.",
     });
   }
